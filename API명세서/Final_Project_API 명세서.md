@@ -2,15 +2,17 @@
 
 Oct 29, 2026 · @혜현
 
+**v1.1** · 2026-10-29 · 리뷰 의견과 화면정의서 v0.4 반영(바뀐 점은 12장 A-02\~A-19) · v1.0 · 2026-10-29 · 최초 작성
+
 ## 1. 개요
 
-이 문서는 프런트엔드(Next.js)와 백엔드(FastAPI)가 주고받는 REST API 64개와 면접 실시간 메시지 22종을 한곳에 정리한 명세다. 경로·요청·응답·오류를 여기서 맞추고, 칸 하나하나의 DB 정의는 테이블 정의서를 따른다.
+이 문서는 프런트엔드(Next.js)와 백엔드(FastAPI)가 주고받는 REST API 64개와 면접 실시간 메시지 23종을 한곳에 정리한 명세다. 경로·요청·응답·오류를 여기서 맞추고, 칸 하나하나의 DB 정의는 테이블 정의서를 따른다.
 
 | 항목 | 내용 |
 | --- | --- |
-| 기준 문서 | TRD v1.5(5장·4-3·14장), PRD v1.3, 화면정의서 v0.2(§12 추가 API) |
+| 기준 문서 | TRD v1.5(5장·4-3·14장), PRD v1.3, 화면정의서 v0.4(§1.1 결정 D-01\~D-10, §12 추가 API), 기술 아키텍처 v1.0(ADR-01·04·05) |
 | 화면 주소 | `http://127.0.0.1:8080` — 같은 PC 브라우저에서만 접속 |
-| REST 기본 주소 | `http://127.0.0.1:8080/api` — frontend가 Next.js rewrites로 api(8000)에 넘긴다. 이 문서의 경로는 `/api`를 뺀 값 |
+| REST 기본 주소 | `http://127.0.0.1:8080/api` — frontend가 Next.js rewrites로 api(8000)에 넘긴다. 미디어 파일 주소 /media/\*도 같은 rewrites로 api에 넘긴다(2-6). 이 문서의 경로는 `/api`를 뺀 값 |
 | 실시간 주소 | WebSocket `ws://127.0.0.1:8000/ws/interview/{session_id}` · WebRTC 음성 UDP 40000\~40019 |
 | 인증 | 로그인 쿠키(HttpOnly, SameSite=Lax). 화면과 API가 같은 주소라 쿠키가 그대로 쓰인다 |
 | 표기 | 🔒 지원자 로그인 · 🛡 관리자(`require_admin`) · 🌐 로그인 불필요 · ➕ TRD 5-1에 없어 이 문서에서 추가한 API |
@@ -25,7 +27,7 @@ Oct 29, 2026 · @혜현
 
 | 규칙 | 내용 |
 | --- | --- |
-| 형식 정의 | 요청·응답·WebSocket 메시지 모두 Pydantic 모델. 모델에 없는 칸이 오면 거절(`extra="forbid"`, 422) |
+| 형식 정의 | 요청·응답·WebSocket 메시지 모두 Pydantic 모델. 모델에 없는 칸이 오면 거절(`extra="forbid"`, 422). 예외: sendBeacon 수신(POST /interview/{sid}/events)은 본문을 직접 풀어 느슨하게 받는다(6장) |
 | id | UUID 문자열 |
 | 시각 | 한국 시간이 붙은 ISO 8601 — `2026-11-03T10:00:00+09:00` |
 | 점수 | 소수 오차를 막기 위해 문자열 — `"70.15"` (소수점 둘째 자리) |
@@ -57,6 +59,8 @@ Oct 29, 2026 · @혜현
 | 423 | 잠김 | 로그인 5번 실패 후 10분 |
 | 429 | 자리가 꽉 참 | 면접 시작(응시 횟수 안 씀) |
 | 500 · 503 | 서버·AI 서버 오류 | 면접 중이면 장애 후보(TRD 7-2) |
+| 206 | 일부 내용 | /media/\* 의 Range 요청(하이라이트 구간 재생) |
+| 308 | 주소 고정 이동 | localhost:8080 → 127.0.0.1:8080 (2-5) |
 
 그 밖에 410(보관 기간이 지난 녹화·음성)과 502(Open API가 답하지 않음)도 쓴다. 오류 응답 예:
 
@@ -83,6 +87,37 @@ Oct 29, 2026 · @혜현
 
 분석 상태 `analysis_status`: `pending`(분석 대기) · `running`(분석 중) · `decided`(확정) · `needs_review`(확인 필요). 공개 상태 `release_status`: `scheduled` · `delayed`(채점이 늦어 다음 날 10:00 공개) · `released` · `purged`.
 
+### 2-5. 접속 주소와 프록시 주의점
+
+로그인 쿠키는 포트가 아니라 호스트 단위로 붙는다. 8080에서 받은 쿠키가 같은 호스트의 8000(WebSocket)에 붙는 것에 기대므로, 호스트를 하나로 고정한다.
+
+- **호스트 고정**: 화면은 `127.0.0.1`로만 쓴다. `localhost:8080`으로 들어오면 frontend가 같은 경로의 `127.0.0.1:8080`으로 308 리다이렉트한다. 다른 호스트로 열면 WebSocket에 쿠키가 안 붙고 `Origin` 검사에도 걸려 면접에 들어갈 수 없다.
+- **Origin 허용 목록**: api는 `http://127.0.0.1:8080` 하나만 받는다. `ws_url`도 이 호스트로만 만든다.
+- **rewrites 대상**: `/api/*` → `http://api:8000/*`, `/media/*` → `http://api:8000/media/*`. WebSocket·WebRTC는 rewrites를 거치지 않고 8000에 바로 붙는다.
+- **본문 크기 제한(확인 필요)**: Next.js 15.5 이후 미들웨어(16에서는 `proxy.ts`)가 걸린 경로는 요청 본문을 기본 10MB까지만 넘긴다. 이력서는 서버 한도 50MB(`upload_max_mb`)까지 받아야 하므로, `proxy.ts`의 matcher에서 `/api`·`/media`를 빼거나 본문 크기 설정을 올린다. 정확한 설정 이름은 Next.js 16 문서로 확인한다(12장 A-16).
+- **응답 시간 제한(확인 필요)**: rewrites 프록시에도 기본 응답 시간 제한이 있다. `POST /coding/{sid}/run`(최대 10초 + 상자 만들기)·`POST /admin/postings/import`처럼 오래 걸리는 요청이 여기에 걸리지 않는지 실측한다.
+
+### 2-6. 미디어 파일 — GET /media/{kind}/{path}
+
+지원자(질문 음성)와 관리자(답변 음성·녹화)가 함께 쓰는 공통 API라 여기 둔다.
+
+| 방식 · 주소 | 권한 | 하는 일 | 화면 |
+| --- | --- | --- | --- |
+| `GET /media/{kind}/{path}` ➕ | 🔒🛡 | 질문 음성·답변 음성·녹화를 권한 확인 후 api가 직접 전달(Range 지원). 관리자 재생은 감사 로그 | S-A09, S-R06 |
+
+`/media/*`는 frontend rewrites로 api에 넘어오고, api가 권한을 확인한 뒤 MinIO에서 읽어 그대로 흘려보낸다. MinIO는 포트를 열지 않으므로(TRD 2-3) 사전 서명 주소는 브라우저가 열 수 없어 쓰지 않는다(기술 아키텍처 ADR-05).
+
+| kind | 주소 예 | 볼 수 있는 사람 | 보관 |
+| --- | --- | --- | --- |
+| `questions` | `/media/questions/{session_id}/3.wav` | 그 면접의 지원자 | 응시 데이터와 같이 |
+| `answers` | `/media/answers/{answer_id}` | 관리자 | 공개 + 7일 |
+| `recordings` | `/media/recordings/{application_id}`/{segment\_no} | 관리자 | 응시 끝 + 3일 |
+
+- 응답 형식은 `audio/wav` · `audio/webm` · `video/webm`이다. `Range` 요청을 받아 206으로 돌려주어 하이라이트 구간(`start_ms`)으로 바로 이동할 수 있게 한다.
+- 권한이 없거나 남의 파일이면 404, 보관 기간이 지났으면 410 `MEDIA_EXPIRED`다.
+- 관리자가 `answers` · `recordings`를 열 때 '녹화 다시 보기' 감사 로그를 남긴다. 같은 파일의 이어지는 Range 요청은 처음 한 번만 센다.
+- `GET /admin/applicants/{aid}`의 `answers[]`·`highlights[]`·recordings\[\]에는 이 주소(`media_url`)를 넣어 준다.
+
 ## 3. 인증·계정 API
 
 가입은 지원자만 하고, 관리자 계정 1개는 설치할 때 만든다(N8). 비밀번호 규칙은 가입·변경·재설정 세 API가 같은 함수로 확인한다.
@@ -97,7 +132,7 @@ Oct 29, 2026 · @혜현
 | `POST /auth/password-reset/confirm` ➕ | 🌐 | 링크 토큰으로 새 비밀번호 저장 | S-C03 ② |
 | `POST /auth/password-change` ➕ | 🔒🛡 | 현재 비밀번호로 확인 후 변경 (관리자 초기 변경 포함) | S-C04, S-A13 |
 | `PATCH /me` ➕ | 🔒 | 이름·휴대전화 수정 (이메일은 못 바꿈) | S-A13 계정 |
-| `DELETE /me` ➕ | 🔒 | 탈퇴: 진행 중 응시 취소, 응시 데이터·계정 즉시 삭제 | S-A13 계정 |
+| `POST /me/withdraw` ➕ | 🔒 | 탈퇴: 진행 중 응시 취소, 응시 데이터·계정 즉시 삭제 | S-A13 계정 |
 | `POST /auth/email-verification` ➕ | 🔒 | 인증 메일 다시 보내기(1분에 1번). 나중에 붙이는 기능 | 추후 |
 | `POST /auth/email-verification/confirm` ➕ | 🌐 | 24시간 토큰으로 인증, `email_verified_at` 기록 | 추후 |
 
@@ -151,10 +186,12 @@ Oct 29, 2026 · @혜현
 
 요청 — `{ "current_password": "…", "new_password": "…" }` → 204. 오류 400 `WRONG_PASSWORD` · 400 `PASSWORD_POLICY` · 400 `SAME_AS_OLD`. 바꾸면 관리자의 `password_change_required`가 풀린다.
 
-### PATCH /me · DELETE /me
+### PATCH /me · POST /me/withdraw
 
 - `PATCH /me` 요청: `{ "name": "홍길동", "phone": "010-1234-5678" }`(바꿀 칸만) → 200 회원 정보.
-- `DELETE /me` 요청: `{ "password": "…", "confirm_text": "탈퇴" }` → 204, 쿠키 삭제. 진행 중 면접이 있으면 먼저 `cancelled`로 끝내고 자리를 돌려준 뒤 지운다. 지운 기록은 `deletion_logs`에 남는다.
+- `POST /me/withdraw` 요청: `{ "password": "…", "confirm_text": "탈퇴" }` → 204, 쿠키 삭제. 진행 중 면접이 있으면 먼저 `cancelled`로 끝내고 자리를 돌려준 뒤 지운다. 지운 기록은 `deletion_logs`에 남는다.
+
+탈퇴는 `DELETE`가 아니라 `POST`로 둔다. `DELETE` 요청의 본문은 뜻이 정해져 있지 않아 중간 프록시가 버릴 수 있는데, 탈퇴에는 비밀번호와 확인 문구를 본문으로 받아야 하기 때문이다. 화면정의서 §12 #4의 `DELETE /me`는 이 경로로 바꾼다.
 
 ## 4. 공고 API
 
@@ -206,6 +243,12 @@ Oct 29, 2026 · @혜현
 - `GET /postings/{id}`는 로그인한 지원자에게 `my_application: { "application_id", "attempt_status" }`(없으면 `null`)를 더 준다. 카드 버튼은 화면정의서 §3.4 표를 따른다.
 - `GET /postings`는 `?job_code=&page=&size=`. 게시 중(`published`)만 내보낸다.
 
+**게시 후 수정(화면정의서 G-14)**: 게시 중인 공고에 대한 `PATCH /admin/postings/{id}`는 화면정의서 §10.3의 허용 항목만 받는다. 허용하지 않는 칸이 있으면 409 `FIELD_LOCKED_AFTER_PUBLISH`다. 바뀐 칸마다 `posting_revisions`(posting\_id, revised\_at, field, before, after)를 남기고, `GET /postings/{id}` 응답에 아래 `revisions`를 넣어 지원자에게 '수정 사항'을 보여 준다.
+
+```json
+"revisions": [ { "revised_at": "2026-11-04T14:00:00+09:00", "field": "location", "summary": "근무지: 서울 강남구 → 서울 서초구" } ]
+```
+
 ### 채점 기준 객체 (관리자 응답에만)
 
 ```json
@@ -222,7 +265,7 @@ Oct 29, 2026 · @혜현
 - 가중치는 5 단위, 항목마다 5 이상, 합계 100. 틀리면 400 `WEIGHT_SUM`.
 - `coding_ratio`는 10 단위(기본 30 = 면접 70 : 코딩 30). `coding_enabled: false`면 무시한다.
 - `pass_score`는 0\~100 정수, 기본 70.
-- 첫 응시가 시작되면 `locked: true`. 그 뒤 `PATCH`에 `criteria`가 있으면 409 `CRITERIA_LOCKED`, 공고 내용 칸은 그대로 바뀜다(JOB-07).
+- 첫 응시가 시작되면 `locked: true`. 그 뒤 `PATCH`에 `criteria`가 있으면 409 `CRITERIA_LOCKED`, 공고 내용 칸은 그대로 바뀐다(JOB-07).
 
 ### POST /admin/postings/{id}/publish · /close
 
@@ -444,12 +487,13 @@ Oct 29, 2026 · @혜현
   "session_id": "5d1c2f0e-…",
   "ws_url": "ws://127.0.0.1:8000/ws/interview/5d1c2f0e-…",
   "question_total": 10,
-  "questions_ready": false
+  "questions_ready": false,
+  "recording_segment": 1
 }
 ```
 
 - `questions_ready: false`면 화면은 S-A08 '질문 준비 중'을 띄우고, WebSocket `preparing` 메시지를 받다가 첫 `question`이 오면 면접을 시작한다. 기다림 상한은 60초(`question_compose_budget_sec`)이고, 넘으면 서버가 질문 DB·예비 질문으로 채운다.
-- 시작 성공 시 `interview:active`를 1 올리고 `holds_seat=true`. 상태는 첫 질문이 나갈 때 `interviewing`이 된다.
+- 시작 성공 시 `interview:active`를 1 올리고 `holds_seat=true`. 상태는 이때 바로 `interviewing`(면접 진행 중)이 된다(TRD 7-1). 응시 횟수만 첫 질문이 나갈 때 쓴다. 그래서 '질문 준비 중' 동안 끊겨도 면접 진행 중과 같은 장애 판단을 받는다.
 
 | 오류 | code | 조건 |
 | --- | --- | --- |
@@ -461,15 +505,15 @@ Oct 29, 2026 · @혜현
 
 ### POST /applications/{id}/interview/resume
 
-요청 본문 없음. 응답은 start와 같은 모양에 `"phase"`와 `"resume_seq"`(다시 낼 질문 번호)를 더한다.
+요청 본문 없음. 응답은 start와 같은 모양에 `"phase"`와 `"resume_seq"`(다시 낼 질문 번호)를 더한다. recording\_segment는 직전 구간보다 1 큰 값이다.
 
-- N을 다시 확인하지 않는다. 자리를 이미 돌려줬으면(끊긴 뒤 10분) 1을 다시 더한다(TRD 5-3).
+- N을 다시 확인하지 않는다. phase가 interview이고 자리를 이미 돌려줬으면(끊긴 뒤 10분) 1을 다시 더한다(TRD 5-3). coding이면 코딩테스트는 동시 면접 수에 세지 않으므로 더하지 않는다.
 - 면접은 끊긴 질문을 처음부터 새 답변 시간으로, 코딩테스트는 마지막 자동 저장 코드와 남은 시간으로 이어 간다.
 - 오류: 409 `PRECHECK_REQUIRED` · 409 `NOT_INTERRUPTED`(상태가 `interrupted`가 아님) · 409 `POSTING_CLOSED`.
 
 ### POST /interview/{sid}/events
 
-탭 닫기·새로고침·뒤로 가기 때 `beforeunload`·`pagehide`에서 `navigator.sendBeacon`으로 보낸다. 창이 닫혀도 전송되도록 본문은 문자열 JSON이다.
+탭 닫기·새로고침·뒤로 가기 때 `beforeunload`·`pagehide`에서 `navigator.sendBeacon`으로 보낸다. 본문을 문자열로 넣으면 `text/plain`으로 가서 Pydantic 본문 파싱이 422로 실패하고, 그러면 '장애 아님'이 '장애'로 잘못 판정된다. 그래서 두 쪽을 모두 지킨다. ① 서버는 Content-Type에 기대지 않고 `request.body()`를 직접 JSON으로 풀고, 풀지 못해도 204를 돌려주며 원문을 `session_events`에 남긴다. ② 화면은 `new Blob([JSON.stringify(body)], { type: 'application/json' })`로 보낸다. 같은 출처(127.0.0.1:8080 → /api)라 사전 요청(preflight)이 없다.
 
 ```json
 { "type": "unload", "at": "2026-11-03T10:07:30+09:00", "detail": "pagehide" }
@@ -480,7 +524,7 @@ Oct 29, 2026 · @혜현
 
 ### POST /interview/{sid}/recording
 
-`multipart/form-data` — `chunk_no`(0부터), `phase`(`interview` · `coding`), `file`(WebM 조각). 응답 204. 실패하면 화면이 1·2·4초 간격으로 3번(`upload_retry_limit`) 다시 올리고, 그래도 안 되면 장애 후보가 된다. 답변 음성은 이 API가 아니라 WebRTC로 보낸다.
+`multipart/form-data` — `segment_no`(접속 구간 번호), `chunk_no`(구간 안에서 0부터), `phase`(`interview` · `coding`), `file`(WebM 10초 조각). 응답 204. `segment_no`는 start·resume 응답의 `recording_segment`를 쓴다(시작 1, 이어가기마다 1씩 늘어남). MediaRecorder 조각은 구간의 첫 조각에만 헤더가 있으므로, 서버는 같은 구간의 조각을 `chunk_no` 순서로 이어 써서 구간마다 파일 하나로 저장한다. 실패하면 화면이 1·2·4초 간격으로 3번(`upload_retry_limit`) 다시 올리고, 그래도 안 되면 장애 후보가 된다. 답변 음성은 이 API가 아니라 WebRTC로 보낸다.
 
 ## 7. 면접 실시간 통신 (WebSocket · WebRTC)
 
@@ -532,8 +576,9 @@ Oct 29, 2026 · @혜현
 | `resume` | `seq`, `remaining_sec`, `phase` | `warn_ack` 뒤 또는 장애 이어가기 뒤 다시 시작 |
 | `paused` | `reason`, `resume_until` | 장애로 멈춤(연결이 살아 있을 때만 도착). 화면은 OV-01 |
 | `phase` | `to`(`coding`), `coding` → 8장 문제 목록 | AI 면접이 끝남 |
-| `terminate` | `reason`, `message` | 면접이 끝남. `reason`: `completed` · `cancelled`(2번째 이탈) · `closed`(마감) · `ended`(장애 아님) · `withdrawn`(동의 철회) |
+| `terminate` | `reason`, `message` | 면접이 끝남. `reason`: `completed` · `cancelled`(2번째 이탈) · `closed`(마감) · `ended`(장애 아님) · `withdrawn`(동의 철회). ended·cancelled에는 detail(unload · permission\_revoked · exit\_twice)을 함께 보내 화면이 OV-07·OV-03을 고른다(D-09) |
 | `error` | `code`, `message` | 형식이 틀린 메시지 등. 연결은 유지 |
+| stt\_retry | seq, retry\_in\_sec(3), message | 최종 글자 변환이 2번 다시 해도 실패함(화면정의서 D-02, OV-04). 화면은 배너를 띄우고 3초 뒤 서버가 같은 seq의 question을 다시 보낸다(답변 시간 새로, 감점 없음). 장애 중단으로 바꾸지 않는다 |
 
 ### 7-5. 메시지 예
 
@@ -550,8 +595,22 @@ Oct 29, 2026 · @혜현
 { "type": "terminate", "reason": "closed", "message": "마감이 되어 면접을 종료합니다." }
 ```
 
-- 1번째 이탈 뒤에는 같은 질문을 멈춘 시점의 남은 시간부터 이어 답하고, 이탈 전후 음성을 합쳐 하나의 답변으로 채점한다(TRD 7-3). PRD v1.3 CHT-02(답변 시간 새로 부여)와 다르므로 12장에 적었다.
+- 1번째 이탈 뒤에는 같은 질문을 멈춘 시점의 남은 시간부터 이어 답하고, 이탈 전후 음성을 합쳐 하나의 답변으로 채점한다(TRD 7-3). 화면정의서 v0.4 D-08로 확정했다(PRD CHT-02 개정 필요, 12장 A-02).
 - 장애로 판단된 구간에 생긴 이탈 신호는 세지 않는다. 면접과 코딩테스트의 이탈 횟수는 합쳐 센다.
+
+### 7-6. 멈춤·다시 답변 규칙
+
+**1번째 이탈 경고창(OV-02)이 떠 있는 동안**
+
+- **화면**: `warn`을 받으면 마이크 트랙을 끄고(`track.enabled = false`) 타이머를 멈춘다. `resume`을 받으면 다시 켠다.
+- **서버**: `warn`을 보낸 때부터 `resume`을 보낼 때까지 들어온 음성 조각은 Redis 스트림과 MinIO에 넣지 않고 버린다. 그래야 이탈 전후를 이어 붙인 답변에 잡음이 섞이지 않는다.
+- **heartbeat**: 숨겨진 탭에서는 브라우저가 타이머를 늦춰 heartbeat가 밀릴 수 있다. 멈춤 상태에서는 heartbeat 15초 누락을 장애로 세지 않고, `resume` 뒤부터 다시 센다. 다만 WebSocket이 비정상으로 닫히거나 `unload`가 오면 멈춤 중에도 평소처럼 판단한다.
+- **다시 이탈**: 경고창이 떠 있는 동안 다시 이탈 신호가 오면 2번째 이탈로 보고 `terminate`(`cancelled`, `exit_twice`)를 보낸다(화면정의서 G-13, 임시 결정).
+
+**음성 글자 변환 최종 실패(화면정의서 D-02)**
+
+- 최종 글자 변환이 2번(`stt_retry_limit`) 다시 해도 실패하면 `stt_retry`를 보내고 같은 질문을 처음부터 다시 낸다. 장애 기록(`session_events`)은 TRD 7-2대로 남기지만 상태는 '면접 진행 중' 그대로다. 연결이 멀쩡한데 재접속·환경 재점검을 시키지 않기 위해서다.
+- **상한(이 문서의 제안)**: 같은 질문에서 `stt_retry`가 2번 연속 나가거나 stt 서버가 응답하지 않으면, 그때는 장애로 보고 `paused`를 보낸다. STT 서버가 죽어 있을 때 같은 질문을 끝없이 다시 내지 않기 위해서다.
 
 ## 8. 코딩테스트 API
 
@@ -671,6 +730,8 @@ Oct 29, 2026 · @혜현
 - `status_reason`: 응시 취소면 `cheating_cancelled`, 마감 종료면 `closed`, 장애 아님 종료면 `ended`.
 - 공개 전·남의 지원·보관 만료는 모두 404 `NOT_FOUND`다. 화면은 `GET /me/applications`의 `release_at`으로 "아직 공개되지 않았습니다"와 "보관 기간이 지났습니다"를 구분한다.
 
+**미응시(마감) 표시**: `not_taken_closed`는 평가 결과가 없어서 이 API는 항상 404다. 화면은 `GET /me/applications`에서 `attempt_status: "not_taken_closed"`를 보고 결과 탭에 "미응시(마감) — 접수 마감까지 응시하지 않아 평가되지 않았습니다"를 보여 준다(INT-10). 이때 `next_action`은 `null`, `release_status`는 `released`가 되지 않으며, 카드는 다른 지원과 같은 삭제 예정일에 사라진다.
+
 ### GET /notifications
 
 ```json
@@ -683,7 +744,7 @@ Oct 29, 2026 · @혜현
 }
 ```
 
-`kind` — 지원자: `result_released` · `deadline_reminder` · `result_expiring`. 관리자: `new_application` · `posting_closing` · `data_purge_soon` · `needs_review`. 메일 보내기가 실패해도 사이트 알림은 항상 남는다(TRD 10장).
+`kind` — 지원자: `result_released` · `deadline_reminder` · `result_expiring`. 관리자: `posting_closing` · `data_purge_soon` · `needs_review`. 신규 지원 알림은 두지 않는다(화면정의서 D-10, TRD 10장). 메일 보내기가 실패해도 사이트 알림은 항상 남는다(TRD 10장).
 
 ## 10. 관리자 API
 
@@ -694,7 +755,6 @@ Oct 29, 2026 · @혜현
 | `GET /admin/postings/{id}/applicants` | 🛡 | 공고별 지원자 목록·점수·판정 | S-R05 |
 | `GET /admin/applicants/{aid}` | 🛡 | 지원자 상세: 리포트·질문별 답변·이력서·코딩·기록·메모 | S-R06 |
 | `GET /admin/applicants/compare?ids=` | 🛡 | 2\~3명 비교 | S-R07 |
-| `GET /admin/applicants/{aid}/media` ➕ | 🛡 | 답변 음성·녹화 재생용 5분짜리 주소. 감사 로그 | S-R06 |
 | `POST /admin/applicants/{aid}/memo` | 🛡 | 내부 메모 쓰기 | S-R06 |
 | `PATCH /admin/memos/{memo_id}` ➕ | 🛡 | 메모 고치기 | S-R06 |
 | `DELETE /admin/memos/{memo_id}` ➕ | 🛡 | 메모 지우기 | S-R06 |
@@ -739,6 +799,7 @@ Oct 29, 2026 · @혜현
   "application_id": "7b2e…",
   "applicant": { "name": "홍길동", "email": "hong@example.com", "phone": "010-1234-5678" },
   "criteria_version": 1,
+  "analysis_status": "decided",
   "result": {
     "decision": "fail",
     "reason": "직무 이해는 좋지만 구체적인 근거가 부족했다. …",
@@ -753,13 +814,15 @@ Oct 29, 2026 · @혜현
       "seq": 3, "kind": "base", "category": "직무", "question": "…", "replaced": false,
       "transcript": "…",
       "scores": [ { "item": "expertise", "score": 4, "quote": "클래스 가중치를 조정해 재현율을 높였습니다", "quote_verified": true } ],
-      "follow_ups": []
+      "follow_ups": [],
+      "media_url": "/media/answers/a91c…"
     }
   ],
-  "highlights": [ { "seq": 3, "kind": "good", "start_ms": 12400, "end_ms": 19800, "item": "expertise" } ],
+  "highlights": [ { "seq": 3, "kind": "good", "start_ms": 12400, "end_ms": 19800, "item": "expertise", "media_url": "/media/answers/a91c…" } ],
   "resume": { "snapshot": { }, "method": "ocr", "ocr_confidence": "0.86", "edited_fields": ["career[0].company"] },
   "coding": { "score": "60.00", "problems": [ { "problem_no": 1, "passed": 8, "total": 10, "code": "…", "paste_blocked": 2, "feedback": "…" } ] },
   "events": [ { "kind": "disconnect", "at": "…", "duration_sec": 42, "judged": "fault", "reason": "heartbeat_timeout" } ],
+  "recordings": [ { "segment_no": 1, "media_url": "/media/recordings/7b2e…/1" } ],
   "recording_until": "2026-11-06T10:40:00+09:00",
   "memos": [ { "memo_id": "…", "body": "…", "created_at": "…", "updated_at": null } ]
 }
@@ -770,10 +833,6 @@ Oct 29, 2026 · @혜현
 - 코딩 `feedback`은 점수에 반영하지 않는다. 숨겨진 테스트 내용은 넣지 않는다.
 - 이 API를 부르면 '결과 보기' 감사 로그가 남는다.
 
-### GET /admin/applicants/{aid}/media
-
-쿼리 — `kind`(`answer` · `recording`), `seq`(`answer`일 때). 응답 — `{ "url": "…", "expires_at": "…" }`(MinIO 5분 주소). 녹화는 응시 끝 + 3일, 답변 음성은 공개 + 7일이 지나면 410 `MEDIA_EXPIRED`. 부를 때마다 '녹화 다시 보기' 감사 로그가 남는다.
-
 ### 메모
 
 - `POST /admin/applicants/{aid}/memo` — `{ "body": "…" }` → 201 메모 객체.
@@ -782,7 +841,7 @@ Oct 29, 2026 · @혜현
 
 ### POST /admin/analysis/{aid}/reprocess
 
-요청 본문 없음. 응답 202 — `{ "analysis_status": "running" }`. 같은 응시 자료로 채점·결정을 처음부터 다시 돌리고, 판정을 사람이 고치지는 않는다. `needs_review`가 아니면 409 `NOT_NEEDS_REVIEW`.
+요청 본문 없음. 응답 202 — `{ "analysis_status": "running" }`. 같은 응시 자료로 채점·결정을 처음부터 다시 돌리고, 판정을 사람이 고치지는 않는다. 다시 돌릴 때도 검증은 같다: ① 형식 ② 값 범위 ③ 근거 문장이 원문에 있음 ④ 판정이 '총점 ≥ 합격 기준'과 일치(D-06). 하나라도 틀리면 1회 다시 판정하고, 그래도 틀리면 다시 `needs_review`가 된다. `needs_review`가 아니면 409 `NOT_NEEDS_REVIEW`.
 
 ### GET /admin/stats · /ops-status
 
@@ -791,12 +850,14 @@ Oct 29, 2026 · @혜현
 
 ```json
 {
-  "needs_review": [ { "application_id": "…", "posting_title": "…", "since": "…", "reason": "rejudge_failed" } ],
+  "needs_review": [ { "application_id": "…", "posting_title": "…", "since": "…", "reason": "threshold_mismatch" } ],
   "mail_failed": { "count": 3, "items": [ { "to": "ho***@example.com", "kind": "result_released", "reason": "550 no such user", "at": "…" } ] },
   "mail_deferred_today": 0,
   "reserve_questions": [ { "category": "경험·프로젝트", "count": 4, "below_minimum": true } ]
 }
 ```
+
+`needs_review[].reason` 값: `threshold_mismatch`(AI 판정이 합격 기준과 어긋나 1회 다시 판정해도 같음, 화면정의서 D-06) · `invalid_format`(형식·값 범위 검증 실패) · `quote_not_found`(근거 문장이 원문에 없음) · `analysis_timeout`(3회 재시도·30분 초과) · `sandbox_error`(코드 실행 환경 오류). 화면은 이 값으로 확인 필요 사유를 보여 준다.
 
 ### GET /admin/settings · PUT /admin/settings/{key}
 
@@ -860,6 +921,7 @@ Oct 29, 2026 · @혜현
 | 관리자 | `MEDIA_EXPIRED` | 410 | 보관 기간 만료 |
 | 관리자 | `NOT_NEEDS_REVIEW` | 409 | 재처리 대상이 아닙니다 |
 | 관리자 | `INVALID_SETTING` | 400 | 1 이상의 정수를 입력해 주세요 |
+| 공고 | FIELD\_LOCKED\_AFTER\_PUBLISH | 409 | 게시 중인 공고에서는 이 항목을 고칠 수 없습니다 (G-14) |
 
 ## 12. 확인 필요 사항
 
@@ -867,16 +929,22 @@ Oct 29, 2026 · @혜현
 
 | # | 항목 | 문서별 내용 | 이 문서의 선택 | 고칠 문서 |
 | --- | --- | --- | --- | --- |
-| A-01 | 기준 PRD 버전 | TRD v1.5는 PRD v1.6 기준, 팀에 공유된 PRD는 v1.3 | TRD v1.5를 우선하고, PRD v1.3과 다른 곳은 이 표에 적음 | PRD v1.6 공유 후 다시 대조 |
-| A-02 | 1번째 화면 이탈 뒤 답변 시간 | PRD v1.3 CHT-02: 같은 질문, 답변 시간 새로 / TRD v1.5 7-3: 남은 시간부터, 음성 합침 | TRD(`warn`·`resume`에 `remaining_sec`) | PRD CHT-02, 화면정의서 OV-02 |
-| A-03 | 음성 글자 바꾸기 최종 실패 | 화면정의서 D-02: 면접 화면에서 같은 질문 다시 답변(OV-04, `stt_retry` 메시지) / TRD v1.5 7-2·7-5: 2번 다시 해도 안 되면 장애 | TRD(`paused`). `stt_retry`는 넣지 않음 | TRD 또는 화면정의서 중 하나 |
-| A-04 | 자리 꽉 참 오류 코드 | TRD 4-3 ① `SEATS_FULL` / 5-3 `CAPACITY_FULL` | `CAPACITY_FULL` | TRD 4-3 |
+| A-01 | 기준 PRD 버전 | TRD v1.5·화면정의서 v0.4는 PRD v1.6 기준, 팀에 공유된 PRD는 v1.3 | TRD v1.5 + 화면정의서 v0.4 결정(D-01\~D-10)을 따름 | PRD v1.6 공유 후 다시 대조 |
+| A-02 | 1번째 화면 이탈 뒤 답변 시간 | PRD v1.3 CHT-02: 새로 부여 / TRD 7-3·화면정의서 D-08: 남은 시간부터 | **해결(D-08)**. `warn`·`resume`에 `remaining_sec`, 멈춘 동안의 음성은 버림(7-6) | PRD CHT-02, TRD 7-3(음성 버리기 명시) |
+| A-03 | 음성 글자 변환 최종 실패 | PRD INT-04·화면정의서 D-02: 같은 질문 다시 답변 / TRD 7-2·7-5: 장애 | **해결(D-02)**. `stt_retry` 후 같은 질문, 같은 질문에서 2번 연속이면 `paused`(상한은 이 문서의 제안) | TRD 7-2·7-5 |
+| A-04 | 자리 꽉 참 오류 코드 | TRD 4-3 `SEATS_FULL` / 5-3·화면정의서 §12 #27 `CAPACITY_FULL` | **해결**. `CAPACITY_FULL` | TRD 4-3 |
 | A-05 | 관리자 공고 경로 | TRD 5-1은 `POST /postings` 표기 + "/admin 아래" 설명 | `/admin/postings/…`로 통일 | TRD 5-1, 화면정의서 S-R01·S-R03 |
-| A-06 | 답변 음성 올리기 | 화면정의서 S-A09: `POST /interview/{sid}/answers/{seq}/audio` / TRD v1.5: WebRTC 실시간 전송, 파일 업로드 없음 | TRD(파일 API 없음) | 화면정의서 S-A09 |
-| A-07 | 장애 판단 시점 | 화면정의서 S-A15: 들어오면 '확인 중' 후 판단 / TRD 7-2: 끊긴 뒤 15초에 바로 판단 | TRD. `interview/state`는 결과를 읽기만 함 | 화면정의서 S-A15 ① |
-| A-08 | 응시 상태 값 이름 | TRD에는 `not_taken_closed`·`ended_closed`·`needs_review`만, 화면정의서는 `drafting`만 | 2-4의 영문 값 제안 | 테이블 정의서 |
-| A-09 | 결과 화면 문의 이메일 | 화면정의서 D-03: 공고에 `contact_email` / PRD N7·RPT-03에는 없음 | 공고·결과 응답에 `contact_email` 넣음 | PRD N7·RPT-03, TRD 4-1 |
-| A-10 | AI 초안 출처·차별 표현 | TRD `source`는 `manual`·`open_api`·`dummy`만, 차별 표현 방식 미정(O-05, T-08) | `ai_draft` 추가, `bias_warnings` 칸만 둠 | TRD 4-1·15장 |
-| A-11 | 녹화 올리기 | TRD 2-2는 "녹음·녹화를 조각내 올리기"만 있고 경로·조각 크기 없음 | `POST /interview/{sid}/recording`, WebM 조각 | TRD 5-1 |
+| A-06 | 답변 음성 올리기 | 화면정의서 v0.2의 파일 업로드 API / TRD v1.5: WebRTC | **해결**. v0.4에서도 빠짐. 파일 API 없음 | 없음 |
+| A-07 | 장애 판단 시점 | 화면정의서 v0.2 S-A15: 들어와서 판단 / TRD 7-2: 끊긴 뒤 15초에 바로 | **해결(D-09)**. `interview/state`는 결과를 읽기만 함, 브라우저가 살아 있는 '장애 아님'은 `terminate`(`ended`, detail)로 OV-07 | TRD 5-2(terminate 사유 값) |
+| A-08 | 응시 상태 칸·값 이름 | TRD에는 `not_taken_closed`·`ended_closed`·`needs_review`만, 화면정의서는 `drafting`까지, 기술 아키텍처는 칸 이름을 `exam_status`로 씀 | 2-4의 값, 칸 이름은 `attempt_status` | 테이블 정의서, 기술 아키텍처 5-2 |
+| A-09 | 결과 화면 문의 이메일 | 화면정의서 D-03: 공고에 `contact_email` / PRD N7·RPT-03에는 없음 | 공고·결과 응답에 `contact_email` 넣음 | PRD N7·RPT-03(O-06), TRD 4-1 |
+| A-10 | AI 초안 출처·차별 표현 | TRD `source`는 `manual`·`open_api`·`dummy`만, 차별 표현은 화면정의서 O-05에서 규칙 기반 사전으로 설계 | `ai_draft` 추가, `bias_warnings` | TRD 4-1·15장 T-08 |
+| A-11 | 녹화 올리기 | TRD에 경로 없음 / 기술 아키텍처 ADR-04: MediaRecorder 10초 WebM 조각 REST | `POST /interview/{sid}/recording`, 10초 조각 | TRD 5-1 |
 | A-12 | 코딩테스트 시작 | 화면정의서 G-03: 안내 화면 + 60초 뒤 자동 시작 / TRD에 없음 | `POST /coding/{sid}/start` 추가 | TRD 9장 |
-| A-13 | 접속 범위 | TRD: 127.0.0.1만(지원자도 서버 PC에서 응시) | 그대로. 다른 PC 접속으로 바꾸면 HTTPS, `Origin`, `cookie_secure`, WebRTC 알리는 주소를 바꿔야 함 | PRD 10-2(전제) |
+| A-13 | 접속 범위·호스트 | TRD·기술 아키텍처 ADR-01: 127.0.0.1만 | `localhost`는 127.0.0.1로 리다이렉트, Origin·`ws_url`은 127.0.0.1 하나(2-5). 다른 PC 접속으로 바꾸면 HTTPS·`cookie_secure`·WebRTC 주소를 바꿈 | PRD 10-2(전제) |
+| A-14 | AI 판정 검증 | TRD 1-2·8-2⑤: 기준 비교 안 함 / 화면정의서 D-06: 기준과 어긋난 판정은 확정하지 않음 | **D-06을 따름**. 1회 다시 판정 → `needs_review`(`threshold_mismatch`) | TRD 1-2·8-2⑤ |
+| A-15 | 신규 지원 알림 | PRD ADM-08: 있음 / TRD 10장·화면정의서 D-10: 없음 | **해제(D-10)**. `new_application` 삭제 | PRD ADM-08 |
+| A-16 | Next.js 프록시 본문 크기·응답 시간 제한 | 미들웨어(`proxy.ts`)가 걸린 경로는 본문 기본 10MB, rewrites에도 응답 시간 제한이 있음 | `/api`·`/media`는 matcher에서 빼거나 제한을 올림(2-5). 설정 이름은 Next.js 16 문서로 확인 | 구현 때 확인 |
+| A-17 | 경고창 중 다시 이탈 | PRD·TRD에 정의 없음 / 화면정의서 G-13: 2번째 이탈 | G-13(임시 결정)을 따름(7-6) | PRD CHT-02·TRD 7-3 |
+| A-18 | 게시 후 공고 수정 | PRD JOB-07은 기준 잠금만 / 화면정의서 G-14: 허용 항목만, 수정 사항 표시 | `posting_revisions`·`revisions[]`, `FIELD_LOCKED_AFTER_PUBLISH`(4장) | PRD JOB-01·07, TRD 4-1 |
+| A-19 | sendBeacon 수신 경로 | 기술 아키텍처 6-4: `POST /sessions/{sid}/beacon` 예시 / 화면정의서 §12 #11: `POST /interview/{sid}/events` | `POST /interview/{sid}/events` 유지, 본문은 Content-Type과 상관없이 JSON으로 풀어 받음(6장) | 기술 아키텍처 6-4, TRD 5-1 |
