@@ -65,8 +65,8 @@ docker exec huge-app-api-1 python -m app.devtools decrypt "<칸 값>"           
 ```sh
 cd backend && python -m pytest && python -m ruff check .
 cd frontend && npx tsc --noEmit && npm run lint
-cd e2e && npm test               # 브라우저 E2E 빠른 묶음 (스택이 떠 있어야 함, 약 5분) — e2e/README.md
-cd e2e && npm run test:full      # 끝까지 응시·코딩·채점·결과 공개 포함 (약 25분)
+cd e2e && npm test               # 브라우저 E2E 빠른 묶음 (스택이 떠 있어야 함, 약 45분) — e2e/README.md
+cd e2e && npm run test:full      # 끝까지 응시·코딩·채점·결과 공개 포함 (약 1시간 10분, 2026-11-20 실측)
 ```
 
 ## 범위
@@ -87,6 +87,7 @@ E2E: Playwright 로 가입·비밀번호 찾기(Mailpit)·지원~면접·녹화 
 설계와 다르게 구현한 부분은 [`CONFLICTS.md`](CONFLICTS.md) 에 있습니다.
 
 질문 품질·질문 관리(2026-11-10): AI 가 만든 질문의 글 검사(찌꺼기·답변 방식 지시·두 가지 묻기·지어낸 경험), 예/아니오 질문 뒤 이유 묻기, 질문 적용 범위(회사 → 그 공고, 직무 → 그 직무, 인성 → 공통), 게시 때 공고 기반 질문 후보·인터넷 참고 후보와 관리자 질문 관리 화면, AI 공고 초안 LangGraph 그래프·한 칸 다시 쓰기.
+질문 자리 자료(2026-11-20): 회사·직무 자리마다 자료 칸 하나(회사 소개·경영 이념·인재상·회사 프로젝트·기술 블로그 / 공고·직무 소개·기술 스택·AI/AX 하는 일·최근 소식)를 무작위로 골라 그 항목으로 질문을 만들고, 다시 만들 때는 다른 칸을 씁니다. 질문 품질은 `개인용/질문품질_기준.md` 의 기준으로 4B 가 채점합니다(측정용).
 바뀐 내역은 [`PATCH_NOTES.md`](PATCH_NOTES.md) 에 날짜별로 있습니다.
 
 ---
