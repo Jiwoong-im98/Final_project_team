@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import math
 import random
 
 import pytest
@@ -38,6 +39,37 @@ def test_groundedNeedsTermOrCloseMeaning():
     assert slot_material.grounded(talent, "질문", fakeVector("측정 판단"))[0]
     assert not slot_material.grounded(talent, "질문", fakeVector("전혀 다른 이야기 날씨"))[0]
     assert slot_material.grounded(Piece("company", "intro", "회사 소개", "글"), "질문", None)[0]  # 벡터가 없으면 확인하지 않음
+
+
+
+def test_jobMaterialAcceptsFromPointFour():
+    """2026-11-23 사용자: 직무 자료는 0.4 까지 받는다 (0.44 에도 괜찮은 질문이 있었다). 회사 자료는 0.5 그대로."""
+    near = [0.45, math.sqrt(1 - 0.45 ** 2)]  # 자료 [1, 0] 과 0.45
+    far = [0.35, math.sqrt(1 - 0.35 ** 2)]
+    job = Piece("job", "jobs_intro", "직무 소개", "사내 문서 검색 비서 개선", vector=[1.0, 0.0])
+    company = Piece("company", "intro", "회사 소개", "회사 글", vector=[1.0, 0.0])
+    assert slot_material.grounded(job, "질문", near)[0]
+    assert not slot_material.grounded(job, "질문", far)[0]
+    assert not slot_material.grounded(company, "질문", near)[0]
+
+
+def test_knowledgeJobSlotSkipsJobIntroWithoutTechName():
+    """2026-11-23 사용자: 기술 이름이 없는 직무 소개 줄은 지식형 직무 자리에 주지 않는다 (c37 '정답률이 어떻게 동작하는 원리').
+    앞의 직무 이름('AI/AX 엔지니어:')과 AI·AX 같은 낱말은 기술 이름으로 치지 않는다. 상황형 자리는 그대로 받는다."""
+    plain = Piece("job", "jobs_intro", "직무 소개", "AI/AX 엔지니어: 정답률·근거 일치율·응답 시간으로 말한다.", vector=[1.0, 0.0])
+    aiOnly = Piece("job", "jobs_intro", "직무 소개", "서비스 개발: AI 기능 화면에서는 AI 답이 늦을 때의 동작을 정한다.", vector=[1.0, 0.0])
+    named = Piece("job", "jobs_intro", "직무 소개", "AI/AX 엔지니어: 문제 정의 → RAG·에이전트 설계 → 배포 순서로 일한다.", vector=[0.0, 1.0])
+    other = Piece("job", "ai_ax_role", "AI/AX 가 하는 일", "AI 결과의 품질을 점검한다.", vector=[1.0, 0.0])
+    assert not slot_material.namesTech(plain) and not slot_material.namesTech(aiOnly)
+    assert slot_material.namesTech(named) and slot_material.namesTech(other)  # 직무 소개 칸만 본다
+    picker = MaterialPicker([plain, aiOnly, named], [[1.0, 0.0]], random.Random(0))
+    assert all(picker.pick("job", ["jobs_intro"], 0, needsTech=True) is named for _ in range(10))
+    assert picker.pick("job", ["jobs_intro"], 0) in (plain, aiOnly, named)
+    onlyPlain = MaterialPicker([plain, other], [[1.0, 0.0]], random.Random(0))
+    assert onlyPlain.pick("job", ["jobs_intro", "ai_ax_role"], 0, needsTech=True) is other  # 칸이 비면 다음 칸
+    assert question_compose.needsTechName("job", question_compose.KNOWLEDGE_FORMS[0])
+    assert not question_compose.needsTechName("job", question_compose.SITUATION_FORMS[0])
+    assert not question_compose.needsTechName("company", None)
 
 
 def pieces():
@@ -83,7 +115,8 @@ def test_jobPromptTopicComesFromPieces(sessionFactory, world):  # noqa: F811
     appId = makeApplication(sessionFactory)
     asyncio.run(question_compose.compose(appId))
     with sessionFactory() as db:
-        texts = [p.text for p in slot_material.jobPieces(db, question_compose.jobTopics(db.get(Application, appId).posting, RESUME), [])]
+        posting = db.get(Application, appId).posting
+        texts = [p.text for p in slot_material.jobPieces(db, question_compose.jobTopics(posting, RESUME), [], posting.title)]
     jobPrompts = [p for p in fake.prompts if p.startswith("[만들 질문] 직무")]
     topics = [p.split("이번 질문의 기술 주제: ")[1].split(" — 이 주제만")[0] for p in jobPrompts]
     assert len(topics) == 4 and len(set(topics)) == 4
@@ -93,6 +126,9 @@ def test_jobPromptTopicComesFromPieces(sessionFactory, world):  # noqa: F811
 def test_unusedMaterialRetriesWithAnotherFieldAndLastTryIsKept(sessionFactory, world, monkeypatch):  # noqa: F811
     fake = world()
     monkeypatch.setattr(slot_material, "grounded", lambda piece, question, vector: (False, 0.1))  # 늘 자료를 안 씀
+    with sessionFactory() as db:  # 칸 3개 (인재상은 2026-11-22 부터 회사 자료가 아니라 회사 소개·경영 이념뿐이라 프로젝트를 더한다)
+        db.add(CompanyProject(title="쇼핑 AI 에이전트", period="2025", summary="상품을 대신 찾아 주는 에이전트"))
+        db.commit()
     appId = makeApplication(sessionFactory)
     asyncio.run(question_compose.compose(appId))
     rows = composed(sessionFactory, appId)
@@ -164,6 +200,18 @@ def test_jobsIntroKeepsOnlyThePostingJobLine():
     assert len(slot_material.jobLines(intro, "마케터")) == 3  # 맞는 직무가 없으면 모두
 
 
+def test_jobsIntroLineIsSplitIntoSentences():
+    """실측 2026-11-20 c31b: 이 공고 직무 줄 하나가 직무 주제로 30번 → 문장·'~며,' 마디로 나누고 직무 이름을 붙인다."""
+    intro = ("- 서비스 개발: 검색·쇼핑 서비스의 백엔드를 만든다.\n"
+             "- AI/AX 엔지니어: AIIT-X를 비롯한 AI 기술로 사용자와 임직원의 문제를 푼다. 문제 정의 → 데이터 수집 → RAG·에이전트 설계 "
+             "순서로 일하며, 정답률·근거 일치율·응답 시간으로 말한다.")
+    assert slot_material.jobLines(intro, "AI/AX 엔지니어") == [
+        "AI/AX 엔지니어: AIIT-X를 비롯한 AI 기술로 사용자와 임직원의 문제를 푼다.",
+        "AI/AX 엔지니어: 문제 정의 → 데이터 수집 → RAG·에이전트 설계 순서로 일하며",
+        "AI/AX 엔지니어: 정답률·근거 일치율·응답 시간으로 말한다.",
+    ]
+
+
 def test_pickerPicksRandomlyAmongTopThreeClosest():
     """사용자 2026-11-20: 가장 가까운 것 하나만 고르니 지원자마다 같은 글(흩어진 행동을 연결하다 10번) → 가까운 위 3개 중 무작위."""
     items = [Piece("company", "post", "글", f"글 {i}", vector=[1.0, i / 10]) for i in range(6)]
@@ -185,19 +233,48 @@ def test_newsWithoutTechNameIsDropped(sessionFactory):
 
 def test_pairedDifferenceFromOneLineIsCaught():
     """실측 2026-11-20 불량 B1 4번: 'RAG와 사내 문서 검색으로 …' 한 줄의 두 말을 'RAG와 사내 문서 검색 기술의 차이' 로 물음."""
-    piece = Piece("job", "ai_ax_role", "AI/AX 가 하는 일", "RAG와 사내 문서 검색으로 임직원의 반복 업무를 줄인다.")
-    assert slot_material.pairedDifference(piece, "RAG와 사내 문서 검색 기술의 차이는 무엇인가요?")
-    assert slot_material.pairedDifference(piece, "RAG 와 사내 문서 검색 간의 차이점을 설명해 주세요.")
-    assert not slot_material.pairedDifference(piece, "RAG와 미세 조정의 차이는 무엇인가요?")  # 자료에 없는 쪽과 비교는 괜찮음
-    assert not slot_material.pairedDifference(piece, "RAG로 사내 문서를 찾을 때 틀리는 원인은 무엇인가요?")
-    assert not slot_material.pairedDifference(None, "RAG와 사내 문서 검색의 차이는?")
+    pieces = [Piece("job", "ai_ax_role", "AI/AX 가 하는 일", "RAG와 사내 문서 검색으로 임직원의 반복 업무를 줄인다."),
+              Piece("job", "news", "최근 소식", "국산 LLM과 NPU로 AI 추론 실증", term="추론")]
+    assert slot_material.pairedDifference(pieces, "RAG와 사내 문서 검색 기술의 차이는 무엇인가요?")
+    assert slot_material.pairedDifference(pieces, "RAG 와 사내 문서 검색 간의 차이점을 설명해 주세요.")
+    assert not slot_material.pairedDifference(pieces, "RAG와 미세 조정의 차이는 무엇인가요?")  # 자료에 없는 쪽과 비교는 괜찮음
+    assert not slot_material.pairedDifference(pieces, "RAG로 사내 문서를 찾을 때 틀리는 원인은 무엇인가요?")
+    assert not slot_material.pairedDifference([], "RAG와 사내 문서 검색의 차이는?")
+
+
+def test_pairedDifferenceLooksAtEveryPieceNotOnlyTheGivenOne():
+    """실측 2026-11-20 c31b: 소식 '추론' 을 받은 자리가 AI/AX 줄의 두 말을 비교해 빠져나감 → 모든 자료 줄과 비교."""
+    pieces = [Piece("job", "news", "최근 소식", "국산 LLM과 NPU로 AI 추론 실증", term="추론"),
+              Piece("job", "ai_ax_role", "AI/AX 가 하는 일", "RAG와 사내 문서 검색으로 임직원의 반복 업무를 줄인다.")]
+    assert slot_material.pairedDifference(
+        pieces, "추론에서 RAG와 사내 문서 검색을 사용할 때 각각의 정보 활용 방식의 차이는 무엇인가요?")
+
+
+def test_pairedDifferenceAllowsListedDifferentThings():
+    """쉼표·가운뎃점으로 늘어놓은 서로 다른 것의 차이는 틀린 전제가 아니다 (c31b 팀 이름, c31c '정답률·근거 일치율' 2번 잘못 막음).
+    두 말이 '와·과'로 붙은 것만 막는다."""
+    pieces = [Piece("job", "ai_ax_role", "AI/AX 가 하는 일", "AI/AX 본부: AIIT-X 모델팀, 생성형 서비스팀, AX 추진팀, MLOps·플랫폼팀."),
+              Piece("job", "jobs_intro", "직무 소개", "AI/AX 엔지니어: 정답률·근거 일치율·응답 시간으로 말한다.")]
+    assert not slot_material.pairedDifference(pieces, "AIIT-X 모델팀과 AX 추진팀의 역할 차이를 어떻게 생각하시나요?")
+    assert not slot_material.pairedDifference(pieces, "MLOps와 플랫폼의 차이는 무엇인가요?")
+    assert not slot_material.pairedDifference(pieces, "정답률과 근거 일치율의 차이를 어떻게 이해하시나요?")
+    listed = [Piece("company", "project", "회사 프로젝트", "품질은 기능별 평가 데이터셋의 정답률과 근거 일치율, 안전성은 편향 질문 800개로 잰다.")]
+    assert not slot_material.pairedDifference(listed, "정답률과 근거 일치율의 차이는 무엇인가요?")  # 나란히 둔 서로 다른 지표
+
+
+def test_pairedDifferenceCatchesReversedForm():
+    """c31c: 'RAG 기술이 사내 문서 검색과 차이를 가지는 이유' 처럼 'A이 B과 차이' 꼴이 검사를 빠져나감."""
+    pieces = [Piece("job", "ai_ax_role", "AI/AX 가 하는 일", "RAG와 사내 문서 검색으로 임직원의 반복 업무를 줄인다.")]
+    assert slot_material.pairedDifference(pieces, "RAG 기술이 사내 문서 검색과 차이를 가지는 이유는 무엇인가요?")
+    assert slot_material.pairedDifference(pieces, "RAG가 사내 문서 검색과의 차이는 무엇인가요?")
+    assert not slot_material.pairedDifference(pieces, "RAG가 미세 조정과 차이를 가지는 이유는 무엇인가요?")
 
 
 def test_pairedDifferenceIsRetriedNotKept(sessionFactory, world, monkeypatch):  # noqa: F811
     """한 줄 두 말 '차이' 질문은 틀린 전제라 마지막 시도에도 받지 않는다 (예비 질문으로)."""
     world()
-    monkeypatch.setattr(slot_material, "pairedDifference", lambda piece, question: piece is not None and piece.kind == "job")
+    monkeypatch.setattr(slot_material, "pairedDifference", lambda pieces, question: True)
     appId = makeApplication(sessionFactory)
     asyncio.run(question_compose.compose(appId))
-    rows = [r for r in composed(sessionFactory, appId) if r.qtype == "job"]
+    rows = [r for r in composed(sessionFactory, appId) if r.qtype in ("job", "company")]
     assert rows and all(r.source != "generated" for r in rows)

@@ -4,7 +4,7 @@
 직무 주제를 공고 줄에서만 뽑으니 지원자가 달라도 같은 주제(LangChain·벡터 DB, RAG …)만 되풀이됐다.
 
 - 자료를 '칸'으로 나눈다.
-  회사 자리: 회사 소개 · 경영 이념 · 인재상 · 회사 프로젝트 · 기술 블로그 최신 글
+  회사 자리: 회사 소개(일하는 방식 포함) · 경영 이념 · 회사 프로젝트 · 기술 블로그 최신 글 (인재상은 인성 질문, 2026-11-22)
   직무 자리: 공고 · 직무 소개 · 사내 기술 스택 · AI/AX 가 하는 일 · 최근 소식(질문 만들기 전에 찾은 임시 자료)
 - 자리마다 칸을 무작위로 뽑고, 그 칸 안에서는 이력서와 가까운 위 3개 항목 가운데 무작위로 하나를 쓴다 (이미 쓴 항목은 뺀다).
   가장 가까운 하나만 쓰면 비슷한 이력서끼리 늘 같은 항목이 됐다 (실측: 같은 블로그 글 10번, 사용자 결정 같은 날).
@@ -28,7 +28,10 @@ from . import company, job_news, rag, tech_blog
 
 log = logging.getLogger("huge.compose")
 
-COMPANY_FIELDS = (("intro", "회사 소개"), ("mission", "경영 이념"), ("talent", "인재상과 일하는 방식"))
+# 회사 질문 자료 칸. 인재상 줄('- …')은 인성 질문이 묻는다 (2026-11-22 사용자: 회사 질문에서는 인재상을 묻지 말자).
+# 남는 '일하는 방식' 한 줄은 칸 하나로 두면 지원자마다 같은 줄이 나오므로 회사 소개 칸에 넣는다 (칸은 intro, 이름은 일하는 방식)
+COMPANY_FIELDS = (("intro", "회사 소개"), ("mission", "경영 이념"), ("work_way", "일하는 방식"))
+FIELD_INTO = {"work_way": "intro"}
 JOB_PROFILE_FIELDS = (("jobs_intro", "직무 소개"), ("ai_ax_role", "AI/AX 가 하는 일"))
 PROJECT_FIELD, POST_FIELD = ("project", "회사가 진행한 프로젝트"), ("post", "회사 기술 블로그 최신 글")
 POSTING_FIELD, STACK_FIELD, NEWS_FIELD = ("posting", "공고"), ("tech_stack", "사내 기술 스택"), ("news", "직무 관련 최근 소식")
@@ -37,6 +40,8 @@ PIECE_MIN_CHARS = 12  # 이보다 짧은 줄은 제목('인재상')으로 보고
 PIECE_MAX_CHARS = 200  # 이보다 긴 줄은 문장으로 나눈다
 # 질문과 자료의 뜻이 이만큼 가까워야 자료를 쓴 것으로 본다 (기술 이름이 없는 항목만). 실측으로 정한다
 MATERIAL_MIN_SIMILARITY = 0.5
+# 직무 자리는 더 낮게 (사용자 2026-11-23: c31b~c36 에서 0.44~0.49 로 반려된 RAG·AIIT-X 질문 상당수가 쓸 만했다)
+JOB_MATERIAL_MIN_SIMILARITY = 0.4
 # 앞에서 받은 같은 종류 질문과 이만큼 가까운 항목은 건너뛴다 (질문끼리 0.7 이상이면 다시 만들기라 그 전에 피한다)
 AVOID_SIMILARITY = 0.6
 PICK_TOP = 3  # 칸 안에서 이력서와 가까운 위 몇 개 가운데 무작위로 고른다
@@ -44,7 +49,9 @@ PICK_TOP = 3  # 칸 안에서 이력서와 가까운 위 몇 개 가운데 무�
 NEWS_TECH_WORDS = ("LLM", "sLLM", "에이전트", "NPU", "GPU", "추론", "파인튜닝", "미세 조정", "임베딩", "멀티모달", "언어 모델", "RAG", "벡터")
 # 'A와 B(의|간의|사이의) 차이' — 같은 자료 줄에 A·B 가 함께 있으면 서로 다른 것처럼 비교한 틀린 전제
 DIFFERENCE = re.compile(r"(\S+?)\s*(?:와|과)\s+(.+?)\s*(?:간의|사이의|의)?\s*(?:개념적\s*)?차이")
+DIFFERENCE_REVERSED = re.compile(r"(\S+?)(?:\s*기술)?(?:이|가|은|는)\s+(.+?)(?:와|과)\s*(?:의\s*)?차이")
 DIFFERENCE_TAIL = re.compile(r"\s*(기술|방식|방법|개념|모델)$")
+DIFFERENCE_PARTICLE = re.compile(r"(을|를|이|가|은|는|의|에서|으로|로)$")
 EMBED_TIMEOUT_SEC = 30
 EMBED_BATCH = 32  # embed 서버는 한 번에 64개까지 받는다 (rag.INDEX_BATCH 와 같은 크기로 나눠 보낸다)
 
@@ -103,7 +110,8 @@ def stackTerms(text: str) -> list[tuple[str, str]]:
 
 def companyPieces(db: Session) -> list[Piece]:
     profile = company.getProfile(db)
-    pieces = [Piece("company", key, label, t) for key, label in COMPANY_FIELDS for t in splitPieces(getattr(profile, key) or "")]
+    pieces = [Piece("company", FIELD_INTO.get(key, key), label, t)
+              for key, label in COMPANY_FIELDS for t in splitPieces(company.fieldText(profile, key))]
     pieces += [Piece("company", *PROJECT_FIELD, company.projectLine(p)[2:]) for p in company.listProjects(db)]
     pieces += [Piece("company", *POST_FIELD, tech_blog.promptLine(p, profile)[2:]) for p in tech_blog.listPosts(db)[:LATEST_POST_COUNT]]
     return pieces
@@ -113,7 +121,29 @@ def jobLines(jobsIntro: str, postingTitle: str) -> list[str]:
     """직무 소개 가운데 이 공고 직무의 줄만 ('AI/AX 엔지니어: …'). 맞는 줄이 없으면 모두 (실측 2026-11-20: 다른 직무 줄이 뽑힘)."""
     lines = splitPieces(jobsIntro)
     mine = [line for line in lines if ":" in line and line.split(":", 1)[0].strip() in (postingTitle or "")]
-    return mine or lines
+    if not mine:
+        return lines
+    # 한 줄뿐이면 지원자마다 같은 주제 (실측 2026-11-20 c31b: 30번) → 문장·'~며,' 마디로 나누고 앞에 직무 이름을 붙인다
+    split = []
+    for line in mine:
+        name, body = (part.strip() for part in line.split(":", 1))
+        parts = [part.strip() for part in re.split(r"(?<=다\.)\s+|(?<=며),\s*", body) if len(part.strip()) >= PIECE_MIN_CHARS]
+        split += [f"{name}: {part}" for part in parts] if len(parts) > 1 else [line]
+    return split
+
+
+# 기술 이름으로 치지 않는 영문 낱말 (모든 줄에 나와 주제를 가르지 못한다)
+GENERIC_LATIN = {"ai", "ax", "it"}
+TECH_NAME = re.compile(r"[A-Za-z][A-Za-z0-9+#\-]*[A-Za-z0-9+#]")
+
+
+def namesTech(piece: Piece) -> bool:
+    """직무 소개 줄이 기술 이름을 담았나 (사용자 2026-11-23). 앞의 직무 이름('AI/AX 엔지니어:')은 빼고 본다.
+    c37: 'AI/AX 엔지니어: 정답률·근거 일치율·응답 시간으로 말한다' 를 지식형 자리가 받아 '정답률이 어떻게 동작하는 원리' 가 나왔다."""
+    if piece.term or piece.field != "jobs_intro":
+        return True
+    body = piece.text.split(": ", 1)[-1]
+    return any(word.lower() not in GENERIC_LATIN for word in TECH_NAME.findall(body))
 
 
 def jobPieces(db: Session, postingTopics: list[str], news: list[job_news.JobNews], postingTitle: str = "") -> list[Piece]:
@@ -182,12 +212,13 @@ class MaterialPicker:
             return None
         return rag.chunkDistance(self.resumeVectors, piece.vector)
 
-    def pick(self, kind: str, order: list[str], attempt: int, avoid: list[list[float]] = ()) -> Piece | None:
+    def pick(self, kind: str, order: list[str], attempt: int, avoid: list[list[float]] = (), needsTech: bool = False) -> Piece | None:
         """attempt 번째 시도에 쓸 항목. 그 칸이 비었으면 다음 칸. 칸 안에서는 안 쓴 것 가운데 이력서와 가까운 위 PICK_TOP 개 중 무작위.
-        avoid(앞에서 받은 같은 종류 질문 벡터)와 가까운 항목은 건너뛴다 — 다 가까우면 그대로 고른다."""
+        avoid(앞에서 받은 같은 종류 질문 벡터)와 가까운 항목은 건너뛴다 — 다 가까우면 그대로 고른다.
+        needsTech: 지식형 직무 자리 — 기술 이름이 없는 직무 소개 줄은 고르지 않는다 (namesTech)."""
         for step in range(len(order)):
             fieldName = order[(attempt + step) % len(order)]
-            inField = [p for p in self.pieces if p.kind == kind and p.field == fieldName]
+            inField = [p for p in self.pieces if p.kind == kind and p.field == fieldName and (not needsTech or namesTech(p))]
             fresh = [p for p in inField if p.key not in self.usedKeys] or inField
             if not fresh:
                 continue
@@ -219,14 +250,27 @@ def grounded(piece: Piece, question: str, questionVector: list[float] | None) ->
         return any(name in question.lower() for name in termNames(piece.term)), similarity
     if similarity is None:
         return True, None
-    return similarity >= MATERIAL_MIN_SIMILARITY, similarity
+    return similarity >= (JOB_MATERIAL_MIN_SIMILARITY if piece.kind == "job" else MATERIAL_MIN_SIMILARITY), similarity
 
 
-def pairedDifference(piece: Piece | None, question: str) -> bool:
-    """질문이 자료 한 줄에 함께 나온 두 말을 'A와 B의 차이'로 묻나 (실측 2026-11-20: 'RAG와 사내 문서 검색 기술의 차이' 4번, 불량 B1)."""
-    match = DIFFERENCE.search(question) if piece is not None else None
-    if not match:
+def pairedDifference(pieces: list[Piece], question: str) -> bool:
+    """질문이 자료 한 줄에 함께 나온 두 말을 'A와 B의 차이'로 묻나 (실측 2026-11-20: 'RAG와 사내 문서 검색 기술의 차이' 4번, 불량 B1).
+    받은 자료 줄만이 아니라 모든 자료 줄과 비교한다 (c31b: 소식 '추론' 을 받은 자리가 AI/AX 줄의 두 말을 비교해 빠져나감).
+    'A이 B과 차이' 꼴도 본다 (c31c: 'RAG 기술이 사내 문서 검색과 차이를 가지는 이유')."""
+    found = [m.group(1, 2) for pattern in (DIFFERENCE, DIFFERENCE_REVERSED) for m in [pattern.search(question)] if m]
+    return any(pairedInPieces(pieces, first, second) for first, second in found)
+
+
+def pairedInPieces(pieces: list[Piece], first: str, second: str) -> bool:
+    first = first.lower()
+    # 'B' 뒤에 말이 더 붙으면('사내 문서 검색을 사용할 때 … 방식') 끝에서 한 낱말씩 줄여 가며 자료에 있는지 본다
+    words = DIFFERENCE_TAIL.sub("", second.strip()).lower().split()
+    seconds = [DIFFERENCE_PARTICLE.sub("", " ".join(words[:n])) for n in range(len(words), 0, -1)]
+    seconds = [s for s in seconds if len(s) >= 2]
+    if not first or not seconds:
         return False
-    text = piece.text.lower()
-    first, second = match.group(1).lower(), DIFFERENCE_TAIL.sub("", match.group(2).strip()).lower()
-    return bool(first and second) and first in text and second in text
+    # 자료에서 두 말이 'A와 B(으)로' 처럼 함께 쓰는 한 수단으로 나올 때만 ('RAG와 사내 문서 검색으로 … 줄인다').
+    # 쉼표·가운뎃점으로 늘어놓은 것, '정답률과 근거 일치율' 처럼 나란히 둔 서로 다른 것의 차이는 막지 않는다
+    # (c31b: 'AIIT-X 모델팀, …, AX 추진팀', c31c: '정답률·근거 일치율' 과 회사 프로젝트 줄의 '정답률과 근거 일치율')
+    joined = [re.compile(rf"{re.escape(a)}\s*(?:와|과)\s+{re.escape(b)}\s*(?:으로|로)") for s in seconds for a, b in ((first, s), (s, first))]
+    return any(j.search(p.text.lower()) for p in pieces for j in joined)

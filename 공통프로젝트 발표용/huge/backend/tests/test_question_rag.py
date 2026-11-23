@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import logging
 import math
 import random
 from datetime import timedelta
@@ -11,7 +12,7 @@ from datetime import timedelta
 import pytest
 
 from app.models import Application, InterviewQuestion, JobPosting, Question, User
-from app.services import company, llm, question_compose, rag, slot_material, tech_blog
+from app.services import company, job_news, llm, question_compose, rag, slot_material, tech_blog
 from app.settings_store import setSetting
 from app.timeutil import now
 
@@ -34,13 +35,14 @@ def fakeVector(text: str) -> list[float]:
 
 
 class FakeWorld:
-    def __init__(self, sessionFactory, copyExamples=False, ungrounded=False, embedDown=False, exampleSimilarity=0.8):
+    def __init__(self, sessionFactory, copyExamples=False, ungrounded=False, embedDown=False, exampleSimilarity=0.6):
         self.sessionFactory = sessionFactory
         self.exampleSimilarity = exampleSimilarity
         self.copyExamples, self.ungrounded, self.embedDown = copyExamples, ungrounded, embedDown
         self.prompts: list[str] = []
         self.keyPointPrompts: list[str] = []
         self.reviewPrompts: list[str] = []
+        self.newsFitPrompts: list[str] = []
         self.reviewAnswer = None  # 다시 보기 답을 정하는 함수 (없으면 모두 통과)
         self.counter = 0
 
@@ -73,6 +75,10 @@ class FakeWorld:
         if schema is question_compose.QuestionReview:  # 만든 질문 다시 보기 — 질문 만들기 호출 수에 넣지 않는다
             self.reviewPrompts.append(user)
             return self.reviewAnswer(user) if self.reviewAnswer else schema(natural=True, accurate=True)
+        if schema is job_news.NewsFit:  # 소식 고르기 — 질문 만들기 호출 수에 넣지 않는다. '의료기' 소식만 상관없다고 본다
+            self.newsFitPrompts.append(user)
+            listing = user.split("<소식>")[1].split("</소식>")[0].strip().splitlines()
+            return schema(related=[i + 1 for i, line in enumerate(listing) if "의료기" not in line])
         assert schema is question_compose.RagQuestion
         self.prompts.append(user)
         self.counter += 1
@@ -86,7 +92,7 @@ class FakeWorld:
                     else "RAG 챗봇을 만들 때 본인이 맡은 역할은 무엇이었나요?")
             return schema(question=text, evidence=evidence, task_count=1)
         kind = user.split("[만들 질문] ")[1].split(" ")[0]
-        # 말끝까지 다르게 (같은 직무 말끝은 same_ending 으로 다시 만든다, 2026-11-18)
+        # 말끝까지 다르게 (11-18 같은 직무 말끝 검사를 위해 넣음, 11-21 검사는 뺌)
         return schema(question=f"{kind} 관점에서 새로 만든 질문은 {self.counter}번째인가요?", task_count=1)
 
 
@@ -112,7 +118,7 @@ def world(sessionFactory, monkeypatch):
         monkeypatch.setattr(tech_blog, "relatedPosts", lambda db, vector, count, excludeIds=frozenset():
                             [p for p in tech_blog.listPosts(db) if p.id not in excludeIds][:count])
 
-        async def noAudio(db, app):
+        async def noAudio(db, app, limit=None):
             return None
         monkeypatch.setattr(question_compose, "synthesizeAll", noAudio)
         return fake
@@ -234,7 +240,7 @@ def test_startTimeoutDuringSlowAudioKeepsSavedQuestions(sessionFactory, world, m
     """질문은 다 만들었는데 음성 만들기가 오래 걸리면, 저장된 질문으로 시작한다 (음성 없는 질문은 자막만, INT-01)."""
     world()
 
-    async def slowAudio(db, app):
+    async def slowAudio(db, app, limit=None):
         await asyncio.sleep(3600)
     monkeypatch.setattr(question_compose, "synthesizeAll", slowAudio)
     monkeypatch.setattr(question_compose, "HURRY_WAIT_SEC", 0.2)
@@ -624,6 +630,9 @@ def test_promptAsksNaturalEndingsAndNoInsideExperience():
 def test_closeExamplesDropsFarOnes():
     examples = [rag.Example(1, "가까움", 0.62, []), rag.Example(2, "경계", rag.EXAMPLE_MIN_SIMILARITY, []), rag.Example(3, "멂", 0.47, [])]
     assert [e.id for e in rag.closeExamples(examples)] == [1, 2]
+    # 2026-11-22 사용자: 정답처럼 베끼지 않게 0.7 이상은 뺀다 (c33: 베낀 예시는 만든 질문과 0.92~1.0)
+    near = [rag.Example(4, "같은 자료로 만든 질문", 0.93, []), rag.Example(5, "경계", rag.EXAMPLE_MAX_SIMILARITY, []), rag.Example(6, "적당", 0.69, [])]
+    assert [e.id for e in rag.closeExamples(near)] == [6]
 
 
 def test_farExamplesAreNotShownAndQuestionIsMadeFromTopic(sessionFactory, world):
@@ -686,6 +695,33 @@ def test_personalitySlotsTakeDifferentAngles(sessionFactory, world):
     assert len(prompts) == 2 and len(angles) == 2 and angles[0] != angles[1]
 
 
+def test_personalityAnglesIncludeTalentAndSpreadFailure():
+    """2026-11-22 사용자: 인성 초점을 늘리고 회사 인재상도. 셋일 때는 3명 중 2명이 '실패' 초점을 받았다 (c35)."""
+    angles = question_compose.PERSONALITY_ANGLES
+    assert len(angles) == 8 and len(set(angles)) == 8 and question_compose.TALENT_ANGLE in angles
+    pairs = [(angles[i % 8], angles[(i + 1) % 8]) for i in range(8)]  # 지원마다 받는 두 초점
+    assert sum(any("실패" in a for a in pair) for pair in pairs) == 2  # 8명 중 2명
+    assert all(a != b for a, b in pairs)
+
+
+def test_talentAngleAsksOneTalentLine(sessionFactory, world, monkeypatch):
+    """인재상 자리는 회사 정보 인재상 줄 하나를 프롬프트에 넣는다. 제목·'일하는 방식' 줄은 고르지 않는다."""
+    from app.services import company_defaults
+    lines = question_compose.talentLines(company_defaults.DEFAULT_PROFILE["talent"])
+    assert len(lines) == 4 and all(not line.startswith(("인재상", "일하는 방식")) for line in lines)
+    fake = world()
+    talent = question_compose.TALENT_ANGLE
+    monkeypatch.setattr(question_compose, "personalityAngleFor", lambda i: talent)
+    appId = makeApplication(sessionFactory)
+    asyncio.run(question_compose.compose(appId))
+    prompts = [p for p in fake.prompts if p.startswith("[만들 질문] 인성")]
+    assert prompts and all(sum(f"인재상: {line}" in p for line in lines) == 1 for p in prompts)  # 줄 하나만
+
+
+def test_talentLinesSkipTitleAndWorkWay():
+    assert question_compose.talentLines("") == [] and question_compose.talentLines("인재상\n일하는 방식: 회고") == []
+
+
 def test_similarCompanyQuestionIsRemade(sessionFactory, world):
     """실측 2026-11-18: 회사 질문 2개가 모두 '사용자 중심 … 하고 싶은 이유는'(유사도 0.75). 말끝은 같아도 되지만 내용이 비슷하면 다시 만든다."""
     fake = world()
@@ -709,32 +745,25 @@ def test_similarCompanyQuestionIsRemade(sessionFactory, world):
     assert any("앞 회사 질문과 내용이 비슷함" in p for p in fake.prompts)
 
 
-def test_resumeQuestionWithSameEndingAsEarlierIsRejected():
-    """실측 2026-11-18: 이력서 질문 2개가 '…Airflow를 활용한 이유는 무엇인가요?' · '…Kubernetes를 활용한 이유는 무엇인가요?'."""
+def test_sameEndingWithDifferentContentIsKept():
+    """사용자 2026-11-21: 내용이 다르면 말끝이 같아도 괜찮다 → 말끝 검사(same_ending, 11-18) 뺌. 같은 일을 다시 묻는 것은 유사도로 막는다."""
     resume = "프로젝트: 추천 모델 재학습 파이프라인 (2023) 주간 재학습과 A/B 검증을 자동화"
     first = "추천 모델 재학습 파이프라인에서 Airflow를 활용한 이유는 무엇인가요?"
     out = question_compose.RagQuestion(question="추천 모델 재학습 파이프라인에서 Kubernetes를 활용한 이유는 무엇인가요?",
                                        evidence="주간 재학습과 A/B 검증을 자동화", task_count=1)
     anchors = ["재학습 파이프라인"]
-    assert question_compose.checkGenerated("resume", out, resume, anchors, [first]) == "same_ending"
-    out.question = "추천 모델 재학습 파이프라인에서 A/B 검증을 자동화할 때 가장 어려웠던 점은 무엇이었나요?"
-    assert question_compose.checkGenerated("resume", out, resume, anchors, [first]) is None
-
-
-def test_jobQuestionWithSameEndingAsEarlierIsRejected():
-    """실측 2026-11-18: 직무 질문 6개 중 5개가 '…핵심 기준은 무엇인가요?'로 끝남 → 앞 직무 질문과 말끝이 같으면 다시 만든다."""
+    assert question_compose.checkGenerated("resume", out, resume, anchors, previous=[first]) is None
     earlier = ["RAG 검색에서 정보의 정확성과 관련된 핵심 기준은 무엇인가요?"]
     same = question_compose.RagQuestion(question="모델 경량화 뒤 배포할 때 고려할 중요한 기준은 무엇인가요?", task_count=1)
-    assert question_compose.checkGenerated("job", same, "", sameKind=earlier) == "same_ending"
-    other = question_compose.RagQuestion(question="모델 경량화에서 양자화와 지식 증류의 차이는 무엇인가요?", task_count=1)
-    assert question_compose.checkGenerated("job", other, "", sameKind=earlier) is None
+    assert question_compose.checkGenerated("job", same, "", previous=earlier) is None
 
 
 def test_jobSlotsGetDifferentForms():
     """직무 자리마다 꼴 하나를 정해 준다 (꼴 예 여러 개를 한꺼번에 주면 '기준은 무엇인가요'로 쏠림)."""
     prompts = [question_compose.ragPrompt("job", "회사", "", [], [], None, "RAG", jobForm=question_compose.jobFormFor(i))
                for i in range(len(question_compose.JOB_FORMS))]
-    assert all(f"이번 질문은 되도록 이 꼴로 쓴다: {form}" in p for form, p in zip(question_compose.JOB_FORMS, prompts, strict=True))
+    forms = [question_compose.jobFormFor(i) for i in range(len(question_compose.JOB_FORMS))]
+    assert all(f"이번 질문은 되도록 이 꼴로 쓴다: {form}" in p for form, p in zip(forms, prompts, strict=True))
     assert len(set(question_compose.JOB_FORMS)) == len(question_compose.JOB_FORMS) >= 4
     assert not any("기준은 무엇인가요" in form for form in question_compose.JOB_FORMS)
 
@@ -923,15 +952,128 @@ def test_repeatedConnectiveIsDetected(text, repeated):
     assert question_compose.repeatedConnective(text) is repeated
 
 
-def test_sameEndingAndRepeatedConnectivePassOnLastTry():
-    """말끝이 같거나 연결 말이 겹치는 것은 큰 흠이 아니라, 마지막 시도에서는 받는다 (2026-11-19 사용자 결정)."""
-    earlier = ["RAG 검색에서 정보의 정확성과 관련된 핵심 기준은 무엇인가요?"]
-    same = question_compose.RagQuestion(question="모델 경량화 뒤 배포할 때 고려할 중요한 기준은 무엇인가요?", task_count=1)
-    assert question_compose.checkGenerated("job", same, "", sameKind=earlier) == "same_ending"
-    assert question_compose.checkGenerated("job", same, "", sameKind=earlier, lastTry=True) is None
+def test_repeatedConnectiveIsFixedInReviewNotRegenerated(sessionFactory, world):
+    """2026-11-22 사용자: 연결 말 두 번은 '교정의 위치지, 다시 만들 이유는 없다'. 규칙 검사는 통과시키고 다시 보기가 고친다.
+    다시 보기가 고친 글을 못 내면 원래 질문을 그대로 받는다 (다시 만들지 않는다)."""
     doubled = question_compose.RagQuestion(question="Python에서 데이터 처리 과정에서 오류가 생기는 원인은 무엇인가요?", task_count=1)
-    assert question_compose.checkGenerated("job", doubled, "") == "repeated_connective"
-    assert question_compose.checkGenerated("job", doubled, "", lastTry=True) is None
+    assert question_compose.checkGenerated("job", doubled, "") is None
+    assert "[연결 말]" in question_compose.reviewPrompt("job", doubled.question, connective=True)
+    assert "[연결 말]" not in question_compose.reviewPrompt("job", doubled.question)
+    fake = world()
+
+    def answer(user):
+        head = user.split("[문장]")[0]
+        if "[연결 말]" in user and "실패를 겪었을 때" in head:
+            return question_compose.QuestionReview(natural=False, fixed="팀 프로젝트에서 실패를 겪은 뒤 어떻게 대처하셨나요?", accurate=True)
+        if "[연결 말]" in user:
+            return question_compose.QuestionReview(natural=False, fixed="", accurate=True)  # 고친 글을 못 냄
+        return question_compose.QuestionReview(natural=True, accurate=True, key_points=["정확한 용어 하나", "정확한 용어 둘"])
+    fake.reviewAnswer = answer
+    personality = iter(["팀 프로젝트에서 실패를 겪었을 때 회의에서 어떻게 대처하셨나요?"])
+    job = iter(["Python에서 데이터 처리 과정에서 오류가 생기는 원인은 무엇인가요?"])
+    base = fake.structured
+
+    async def structured(schema, system, user, timeoutSec, **kwargs):
+        if schema is question_compose.RagQuestion and user.startswith("[만들 질문] 인성"):
+            text = next(personality, None)
+            if text:
+                return schema(question=text, task_count=1)
+        if schema is question_compose.RagQuestion and user.startswith("[만들 질문] 직무"):
+            text = next(job, None)
+            if text:
+                return schema(question=text, task_count=1)
+        return await base(schema, system, user, timeoutSec, **kwargs)
+    llm.structured = structured
+    appId = makeApplication(sessionFactory)
+    asyncio.run(question_compose.compose(appId))
+    rows = composed(sessionFactory, appId)
+    assert rows[0].text == "팀 프로젝트에서 실패를 겪은 뒤 어떻게 대처하셨나요?" and rows[0].regen_count == 0  # 고친 글
+    jobs = [r for r in rows if r.qtype == "job"]
+    assert jobs[0].text == "Python에서 데이터 처리 과정에서 오류가 생기는 원인은 무엇인가요?" and jobs[0].regen_count == 0  # 그대로
+
+
+def test_awkwardIsToleratedFromSecondAttempt(sessionFactory, world, caplog):
+    """2026-11-23 사용자: AI 가 만든 글이라 어색함은 어느 정도 감수. 첫 시도는 다시 만들고, 둘째 시도부터는
+    고친 글을 못 써도 원래 질문을 받는다. 고친 글을 못 쓴 까닭은 로그에 남긴다."""
+    fake = world()
+    first = "팀 프로젝트의 교훈은 협업 방식에 무엇을 남기셨나요?"
+    second = "팀 프로젝트의 교훈을 다음 협업에 어떻게 쓰셨나요?"
+
+    def answer(user):
+        head = user.split("[문장]")[0]
+        if "교훈" in head:
+            return question_compose.QuestionReview(natural=False, fixed="", accurate=True, reason="앞뒤가 어색함")
+        return question_compose.QuestionReview(natural=True, accurate=True, key_points=["정확한 용어 하나", "정확한 용어 둘"])
+    fake.reviewAnswer = answer
+    personality = iter([first, second])
+    base = fake.structured
+
+    async def structured(schema, system, user, timeoutSec, **kwargs):
+        if schema is question_compose.RagQuestion and user.startswith("[만들 질문] 인성"):
+            text = next(personality, None)
+            if text:
+                return schema(question=text, task_count=1)
+        return await base(schema, system, user, timeoutSec, **kwargs)
+    llm.structured = structured
+    appId = makeApplication(sessionFactory)
+    with caplog.at_level(logging.INFO, logger="huge.compose"):
+        asyncio.run(question_compose.compose(appId))
+    rows = composed(sessionFactory, appId)
+    assert rows[0].text == second and rows[0].regen_count == 1
+    assert "awkward, fix unusable [empty]" in caplog.text
+    assert "awkward, kept original [empty]" in caplog.text
+
+
+def test_awkwardReviewReturningSameTextIsAccepted(sessionFactory, world, caplog):
+    """2026-11-23 사용자: 다시 보기가 어색하다면서 같은 글을 내면(고칠 곳을 못 찾음) 다시 만들지 않고 받는다 (c37 4번)."""
+    fake = world()
+    text = "팀 프로젝트의 교훈은 협업 방식에 무엇을 남기셨나요?"
+
+    def answer(user):
+        if "교훈" in user.split("[문장]")[0]:
+            return question_compose.QuestionReview(natural=False, fixed=text, accurate=True, reason="어색함")
+        return question_compose.QuestionReview(natural=True, accurate=True, key_points=["정확한 용어 하나", "정확한 용어 둘"])
+    fake.reviewAnswer = answer
+    personality = iter([text])
+    base = fake.structured
+
+    async def structured(schema, system, user, timeoutSec, **kwargs):
+        if schema is question_compose.RagQuestion and user.startswith("[만들 질문] 인성"):
+            nextText = next(personality, None)
+            if nextText:
+                return schema(question=nextText, task_count=1)
+        return await base(schema, system, user, timeoutSec, **kwargs)
+    llm.structured = structured
+    appId = makeApplication(sessionFactory)
+    with caplog.at_level(logging.INFO, logger="huge.compose"):
+        asyncio.run(question_compose.compose(appId))
+    rows = composed(sessionFactory, appId)
+    assert rows[0].text == text and rows[0].regen_count == 0
+    assert "awkward, same text kept" in caplog.text
+
+
+def test_situationPromptAsksForTopicOrRequiredSkillName():
+    """2026-11-23 사용자: 상황 안에 이름을 넣되 직무가 요구하는 기술 위주로 (기술 주제·지원자 기술도)."""
+    topic, situationForm = "AIIT-X 사내 문서 검색", question_compose.SITUATION_FORMS[0]
+    situation = question_compose.ragPrompt("job", "회사", "", [], [], None, topic, jobForm=situationForm, requiredSkills=["Python", "FastAPI"])
+    assert "기술 주제에 적힌 이름" in situation and "공고가 요구하는 기술(Python, FastAPI)" in situation
+    bare = question_compose.ragPrompt("job", "회사", "", [], [], None, topic, jobForm=situationForm)
+    assert "기술 주제에 적힌 이름" in bare and "공고가 요구하는 기술" not in bare
+    knowledge = question_compose.ragPrompt("job", "회사", "", [], [], None, topic, jobForm=question_compose.KNOWLEDGE_FORMS[0],
+                                           requiredSkills=["Python"])
+    assert "기술 주제에 적힌 이름" not in knowledge
+
+
+def test_requiredSkillsComeFromLatestCriteria():
+    class Criteria:
+        def __init__(self, skills):
+            self.screening_required_skills = skills
+
+    class Posting:
+        criteria = [Criteria(["Java"]), Criteria(["Python", " ", "FastAPI"])]
+    assert question_compose.requiredSkillsOf(Posting()) == ["Python", "FastAPI"]
+    Posting.criteria = []
+    assert question_compose.requiredSkillsOf(Posting()) == []
 
 
 def test_bankFallbackPrefersReserveNotSimilarToSameKind(sessionFactory, world, monkeypatch):
@@ -950,3 +1092,34 @@ def test_bankFallbackPrefersReserveNotSimilarToSameKind(sessionFactory, world, m
         # 모두 비슷하면 그래도 하나는 쓴다 (중복 0.9 아래)
         monkeypatch.setattr(rag, "vectorsFor", lambda _db, ids: {i: [0.75, math.sqrt(1 - 0.75 ** 2)] for i in ids})
         assert question_compose.bankFallback(db, app, "company", chosen, ctx).id == first.id
+
+
+def test_jobFormsAlternateKnowledgeAndSituation():
+    """사용자 2026-11-21: 직무 질문에 상황형 2개 정도. 직무 4자리는 어디서 시작해도 상황형이 2개."""
+    for start in range(len(question_compose.JOB_FORMS)):
+        forms = [question_compose.jobFormFor(start + i) for i in range(4)]
+        assert sum(f in question_compose.SITUATION_FORMS for f in forms) == 2
+    situation = question_compose.ragPrompt("job", "회사", "", [], [], None, "RAG", jobForm=question_compose.SITUATION_FORMS[0])
+    knowledge = question_compose.ragPrompt("job", "회사", "", [], [], None, "RAG", jobForm=question_compose.KNOWLEDGE_FORMS[0])
+    assert "상황 질문이다" in situation and "상황 질문이다" not in knowledge
+    assert not question_compose.JOB_EXPERIENCE.search("검색 정확도가 떨어졌다면 무엇부터 확인하시겠어요?")
+
+
+def test_onlyFirstQuestionAudioBeforeReadyRestInBackground(sessionFactory, world, monkeypatch):
+    """2026-11-22 사용자(속도 ①): 첫 질문 음성만 만들고 준비 완료, 나머지 9개는 면접 중에 뒤에서 만든다."""
+    world()
+    calls = []
+
+    async def audio(db, app, limit=None):
+        calls.append((limit, db.get(Application, app.id).questions_status))
+    monkeypatch.setattr(question_compose, "synthesizeAll", audio)
+    appId = makeApplication(sessionFactory)
+
+    async def run():
+        await question_compose.compose(appId)
+        await question_compose.waitAudio(appId, timeoutSec=5)
+
+    asyncio.run(run())
+    assert calls[0][0] == 1 and calls[0][1] != "ready"  # 첫 질문 음성은 준비 완료 전에
+    assert calls[1] == (None, "ready")  # 나머지는 준비 완료 뒤에
+    assert appId not in question_compose.audioTasks
